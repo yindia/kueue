@@ -30,6 +30,7 @@
     - [Integration tests](#integration-tests)
     - [E2E tests](#e2e-tests)
   - [Graduation Criteria](#graduation-criteria)
+    - [ClusterProfile authentication](#clusterprofile-authentication)
 - [Implementation History](#implementation-history)
 - [Drawbacks](#drawbacks)
 - [Alternatives](#alternatives)
@@ -169,6 +170,20 @@ deployments with very high job throughput (above 1M jobs per day).
   * Recommended deployment practice is to use `locationType=Secret` or
     `ClusterProfile` instead of `Path` in production environments.
 
+* **The upstream ClusterProfile API is alpha**: Kueue reads
+  `multicluster.x-k8s.io/v1alpha2` ClusterProfiles from the Cluster Inventory API
+  ([KEP-4322](https://github.com/kubernetes/enhancements/tree/master/keps/sig-multicluster/4322-cluster-inventory)),
+  which is still alpha. A later upstream version may stop serving `v1alpha2` or change
+  the access provider fields. This is mitigated by:
+  * Kueue's own API references a ClusterProfile only by name, so an upstream
+    version change needs a new Kueue release, not a change to `MultiKueueCluster` objects.
+  * kueue-controller-manager fails at startup with a clear error when the CRD does not
+    serve `v1alpha2`, instead of failing later per cluster.
+
+* **Admins may install the ClusterProfile CRD after Kueue starts**: the CRD is detected
+  only at startup, so `MultiKueueCluster` objects that use `clusterProfile` stay inactive
+  until kueue-controller-manager restarts. The setup guide must document the restart.
+
 ## Design Details
 MultiKueue will be enabled on a cluster queue using the admission check fields.
 Just like ProvisioningRequest, MultiKueue will have its own configuration, 
@@ -271,7 +286,17 @@ The controller obtains cluster credentials based on the `MultiKueueCluster` spec
 
 - When `clusterProfile` is provided, the controller relies on the
   [client-go credential plugin mechanism](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#client-go-credential-plugins) to obtain and refresh credentials for the remote cluster as described in [KEP-5339](https://github.com/kubernetes/enhancements/blob/master/keps/sig-multicluster/5339-clusterprofile-plugin-credentials/README.md).
-  This requires installation of the ClusterProfile CRD (`clusterprofiles.multicluster.x-k8s.io`). If your Kueue deployment is already running, you must restart it after installing the CRD for the changes to take effect.
+  This source is behind the `MultiKueueClusterProfile` feature gate and requires the ClusterProfile CRD (`clusterprofiles.multicluster.x-k8s.io`) serving `v1alpha2`.
+  kueue-controller-manager checks the CRD once, at startup:
+
+  | Gate | ClusterProfile CRD | kueue-controller-manager | `MultiKueueCluster` with `clusterProfile` |
+  |---|---|---|---|
+  | off | any | Does not read ClusterProfiles. | `Active=False`, reason `MultiKueueClusterProfileFeatureDisabled`. |
+  | on | not installed | Starts and does not watch ClusterProfiles. `kubeConfig` clusters work as usual. | `Active=False`, reason `BadClusterProfile`. |
+  | on | installed, does not serve `v1alpha2` | Exits at startup with an error naming the served versions. | - |
+  | on | installed, serves `v1alpha2` | Watches ClusterProfiles in the Kueue namespace and requeues the `MultiKueueCluster` that references a changed ClusterProfile. | Connects using the matched access provider. |
+
+  Admins who install the CRD while Kueue is running must restart kueue-controller-manager.
 
   The authentication flow is as follows:
   1. The controller reads the `ClusterProfile` object referenced by the `MultiKueueCluster`. The `ClusterProfile` contains a list of access providers.
@@ -533,9 +558,18 @@ including situations like:
 * Job finishes with an error.
 * Job status changes frequently.
 
+For the `MultiKueueClusterProfile` feature gate, integration tests cover:
+
+* Gate off: a `MultiKueueCluster` with `clusterProfile` reports `MultiKueueClusterProfileFeatureDisabled`.
+* Gate on, CRD not installed: kueue-controller-manager starts and a `kubeConfig` cluster becomes `Active`.
+* Gate on, CRD installed: a ClusterProfile change requeues the `MultiKueueCluster` that references it.
+
 #### E2E tests
 Should be created and cover similar use cases as integration tests. For start
 it should focus on JobSet.
+
+For the `MultiKueueClusterProfile` feature gate, the sequential MultiKueue e2e suite
+connects to a worker cluster through a ClusterProfile and a credential plugin.
 
 ### Graduation Criteria
 The feature starts at the alpha level, with a feature gate.
@@ -555,7 +589,42 @@ Graduation to beta criteria:
 * Major bugs and deficiencies are not found/fixed.
 * Roadmap for missing features is defined.
 
+#### ClusterProfile authentication
+
+The `MultiKueueClusterProfile` feature gate graduates on its own,
+independently of the `MultiKueue` feature gate.
+
+Alpha (v0.15):
+
+* Feature gate disabled by default.
+* `clusterProfile` source on `MultiKueueCluster` and `credentialsProviders` in the Configuration API.
+* Setup guide.
+
+Later alpha releases added an e2e test (v0.16) and replaced `credentialsProviders`
+with `accessProviders` (v0.19).
+
+Beta (target v0.21), feature gate enabled by default:
+
+* kueue-controller-manager starts when the gate is on and the ClusterProfile CRD is not installed,
+  and `kubeConfig` clusters keep working.
+* A `MultiKueueCluster` that references a ClusterProfile while the CRD is not installed
+  reports a dedicated reason instead of `BadClusterProfile`.
+* Unit and integration tests set the gate explicitly for both states.
+* The setup guide says the feature is enabled by default and that installing the CRD
+  while Kueue is running requires a restart of kueue-controller-manager.
+* Feedback from at least one adopter outside Kueue, such as the Open Cluster Management integration.
+* Kueue graduates this gate independently of the upstream ClusterProfile API maturity.
+  Kueue keeps supporting `v1alpha2` while upstream serves it,
+  and adds support for a newer upstream version in a minor release before upstream stops serving `v1alpha2`.
+
+GA:
+
+* The upstream ClusterProfile API is beta or GA, and Kueue supports that version.
+* All reported bugs are fixed.
+
 ## Implementation History
+* 2026-11-01 Add graduation criteria for the `MultiKueueClusterProfile` feature gate.
+* 2026-10-16 kueue-controller-manager starts when `MultiKueueClusterProfile` is enabled and the ClusterProfile CRD is not installed.
 * 2026-06-09 Add ClusterProfile accessProviders configuration and deprecate credentialsProviders.
 * 2023-11-28 Initial KEP.
 
